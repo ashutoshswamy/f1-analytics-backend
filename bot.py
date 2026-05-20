@@ -15,8 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-os.makedirs("f1_cache", exist_ok=True)
-fastf1.Cache.enable_cache("f1_cache", max_size_gb=2)
+fastf1.Cache.no_cache()
 
 DIVIDER = "─" * 20 + "\n"
 
