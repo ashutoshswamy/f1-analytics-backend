@@ -25,9 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Limit disk cache to 2 GB to prevent filling instance storage
-os.makedirs("f1_cache", exist_ok=True)
-fastf1.Cache.enable_cache("f1_cache", max_size_gb=2)
+fastf1.Cache.disabled()
 
 # Only 1 session load at a time — prevents concurrent RAM spikes on 512MB instance
 _session_load_sem = asyncio.Semaphore(1)
