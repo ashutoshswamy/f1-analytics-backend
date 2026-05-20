@@ -4,14 +4,13 @@ import json
 import asyncio
 import urllib.request
 import ssl
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import fastf1
-import fastf1.plotting
 
 
 app = FastAPI(title="F1 Analytics Bot API", description="High-performance backend API serving F1 telemetry and statistics")
@@ -34,8 +33,6 @@ _session_locks: dict = {}
 @lru_cache(maxsize=4)
 def _load_session_sync(year: int, location: str | int, session_type: str):
     s = fastf1.get_session(year, location, session_type)
-    # Never load telemetry=True globally — too heavy for 512MB RAM.
-    # Telemetry is fetched per-lap via lap.get_car_data() instead.
     s.load(telemetry=False, weather=False, messages=False)
     return s
 
@@ -50,8 +47,51 @@ async def _load_session(year: int, location: str | int, session_type: str):
                 None, _load_session_sync, year, location, session_type
             )
 
+
+DRIVER_COLORS = {
+    "VER": "#3671C6", "PER": "#3671C6",
+    "HAM": "#27F4D2", "RUS": "#27F4D2",
+    "LEC": "#E8002D", "SAI": "#E8002D",
+    "NOR": "#FF8000", "PIA": "#FF8000",
+    "ALO": "#358C75", "STR": "#358C75",
+    "GAS": "#0093CC", "OCO": "#0093CC",
+    "ALB": "#64C4FF", "SAR": "#64C4FF",
+    "TSU": "#6692FF", "LAW": "#6692FF",
+    "BOT": "#C92D4B", "ZHO": "#C92D4B",
+    "MAG": "#B6BABD", "HUL": "#B6BABD",
+    "BEA": "#B6BABD", "ANT": "#27F4D2",
+    "DOO": "#FF8000", "HAD": "#6692FF",
+}
+
 def get_ssl_context():
     return ssl._create_unverified_context()
+
+def fetch_openf1_json(url: str):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        context = get_ssl_context()
+        with urllib.request.urlopen(req, context=context, timeout=30) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        print(f"OpenF1 API Error ({url}): {e}")
+        return None
+
+async def fetch_openf1(url: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch_openf1_json, url)
+
+def format_lap_time_seconds(seconds):
+    if seconds is None:
+        return "-"
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        return "-"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    if minutes > 0:
+        return f"{minutes}:{secs:06.3f}"
+    return f"{secs:.3f}"
 
 def fetch_ergast_json(url: str):
     try:
@@ -424,86 +464,122 @@ async def get_telemetry(year: int, location: str, driver1: str, driver2: str):
         driver1 = driver1.upper()
         driver2 = driver2.upper()
 
-        session = await _load_session(year, location, "R")
+        # 1. Find race session key
+        sessions = await fetch_openf1(f"https://api.openf1.org/v1/sessions?year={year}&session_name=Race") or []
+        loc_clean = location.lower().strip()
+        session_key = None
+        for s in sessions:
+            country = (s.get("country_name") or "").lower()
+            circuit = (s.get("circuit_short_name") or "").lower()
+            loc_field = (s.get("location") or "").lower()
+            if loc_clean in country or loc_clean in circuit or loc_clean in loc_field or country in loc_clean or circuit in loc_clean:
+                session_key = s["session_key"]
+                break
 
-        # Pick fastest laps
-        lap1 = session.laps.pick_drivers(driver1).pick_fastest()
-        lap2 = session.laps.pick_drivers(driver2).pick_fastest()
+        if not session_key:
+            raise HTTPException(status_code=404, detail=f"No race session found for {year} {location}")
 
-        if lap1 is None or len(lap1) == 0:
-            raise HTTPException(status_code=404, detail=f"No telemetry laps found for driver {driver1}")
-        if lap2 is None or len(lap2) == 0:
-            raise HTTPException(status_code=404, detail=f"No telemetry laps found for driver {driver2}")
+        # 2. Fetch driver info in parallel
+        d1_resp, d2_resp = await asyncio.gather(
+            fetch_openf1(f"https://api.openf1.org/v1/drivers?session_key={session_key}&name_acronym={driver1}"),
+            fetch_openf1(f"https://api.openf1.org/v1/drivers?session_key={session_key}&name_acronym={driver2}")
+        )
 
-        tel1 = lap1.get_car_data().add_distance()
-        tel2 = lap2.get_car_data().add_distance()
+        d1_resp = d1_resp or []
+        d2_resp = d2_resp or []
+        if not d1_resp:
+            raise HTTPException(status_code=404, detail=f"Driver {driver1} not found in session")
+        if not d2_resp:
+            raise HTTPException(status_code=404, detail=f"Driver {driver2} not found in session")
 
-        # Try to fetch team colors
-        try:
-            color1 = fastf1.plotting.get_driver_color(driver1, session=session)
-            if not color1 or not isinstance(color1, str) or len(color1) < 3:
-                color1 = "#FF1801"
-        except Exception:
-            color1 = "#FF1801" # Default F1 Red
-        try:
-            color2 = fastf1.plotting.get_driver_color(driver2, session=session)
-            if not color2 or not isinstance(color2, str) or len(color2) < 3:
-                color2 = "#00E1D9"
-        except Exception:
-            color2 = "#00E1D9" # Contrast Cyan
+        d1_num = d1_resp[0]["driver_number"]
+        d2_num = d2_resp[0]["driver_number"]
+        d1_fullname = d1_resp[0].get("full_name", driver1)
+        d2_fullname = d2_resp[0].get("full_name", driver2)
 
-        # Defensive padding: Ensure required columns exist
-        for col in ["Speed", "Throttle", "Brake", "Gear"]:
-            if col not in tel1.columns:
-                tel1[col] = 0
-            if col not in tel2.columns:
-                tel2[col] = 0
+        # 3. Fetch laps in parallel, find fastest
+        laps1_raw, laps2_raw = await asyncio.gather(
+            fetch_openf1(f"https://api.openf1.org/v1/laps?session_key={session_key}&driver_number={d1_num}"),
+            fetch_openf1(f"https://api.openf1.org/v1/laps?session_key={session_key}&driver_number={d2_num}")
+        )
 
-        # Calculate driver comparison statistics
+        def find_fastest(laps_raw, code):
+            valid = [l for l in (laps_raw or []) if l.get("lap_duration") and not l.get("is_pit_out_lap")]
+            if not valid:
+                raise HTTPException(status_code=404, detail=f"No valid laps for {code}")
+            return min(valid, key=lambda l: l["lap_duration"])
+
+        lap1 = find_fastest(laps1_raw, driver1)
+        lap2 = find_fastest(laps2_raw, driver2)
+
+        # 4. Fetch car data for each fastest lap in parallel
+        def lap_time_range(lap):
+            start_str = lap["date_start"]
+            start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+            end = start + timedelta(seconds=float(lap["lap_duration"]) + 2)
+            end_str = end.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            return start_str, end_str
+
+        d1_start, d1_end = lap_time_range(lap1)
+        d2_start, d2_end = lap_time_range(lap2)
+
+        car1_raw, car2_raw = await asyncio.gather(
+            fetch_openf1(f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={d1_num}&date>={d1_start}&date<={d1_end}"),
+            fetch_openf1(f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={d2_num}&date>={d2_start}&date<={d2_end}")
+        )
+
+        if not car1_raw:
+            raise HTTPException(status_code=404, detail=f"No car telemetry for {driver1}")
+        if not car2_raw:
+            raise HTTPException(status_code=404, detail=f"No car telemetry for {driver2}")
+
+        # 5. Build DataFrames and compute cumulative distance from speed integration
+        def build_telemetry_df(car_data):
+            df = pd.DataFrame(car_data)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
+            df["dt"] = df["date"].diff().dt.total_seconds().fillna(0)
+            for col in ["speed", "throttle", "brake", "n_gear"]:
+                if col not in df.columns:
+                    df[col] = 0
+            df["distance"] = (df["speed"] * (1000 / 3600) * df["dt"]).cumsum()
+            return df
+
+        df1 = build_telemetry_df(car1_raw)
+        df2 = build_telemetry_df(car2_raw)
+
+        # 6. Driver colors
+        color1 = DRIVER_COLORS.get(driver1, "#FF1801")
+        color2 = DRIVER_COLORS.get(driver2, "#00E1D9")
+
+        # 7. Stats
         stats1 = {
-            "maxSpeed": float(tel1["Speed"].max()) if not tel1.empty else 0.0,
-            "avgSpeed": float(tel1["Speed"].mean()) if not tel1.empty else 0.0,
-            "maxThrottle": float(tel1["Throttle"].max()) if not tel1.empty else 0.0,
-            "avgThrottle": float(tel1["Throttle"].mean()) if not tel1.empty else 0.0,
+            "maxSpeed": float(df1["speed"].max()),
+            "avgSpeed": float(df1["speed"].mean()),
+            "maxThrottle": float(df1["throttle"].max()),
+            "avgThrottle": float(df1["throttle"].mean()),
         }
         stats2 = {
-            "maxSpeed": float(tel2["Speed"].max()) if not tel2.empty else 0.0,
-            "avgSpeed": float(tel2["Speed"].mean()) if not tel2.empty else 0.0,
-            "maxThrottle": float(tel2["Throttle"].max()) if not tel2.empty else 0.0,
-            "avgThrottle": float(tel2["Throttle"].mean()) if not tel2.empty else 0.0,
+            "maxSpeed": float(df2["speed"].max()),
+            "avgSpeed": float(df2["speed"].mean()),
+            "maxThrottle": float(df2["throttle"].max()),
+            "avgThrottle": float(df2["throttle"].mean()),
         }
 
-        # Align both driver datasets to a common grid via linear interpolation
-        max_dist = min(tel1["Distance"].max(), tel2["Distance"].max())
+        # 8. Interpolate both drivers onto 400-point common distance grid
+        max_dist = min(float(df1["distance"].max()), float(df2["distance"].max()))
         common_grid = np.linspace(0, max_dist, num=400)
 
-        speed1_interp = np.interp(common_grid, tel1["Distance"], tel1["Speed"])
-        throttle1_interp = np.interp(common_grid, tel1["Distance"], tel1["Throttle"])
-        brake1_interp = np.interp(common_grid, tel1["Distance"], tel1["Brake"])
-        gear1_interp = np.interp(common_grid, tel1["Distance"], tel1["Gear"])
+        def interp(df, col):
+            return np.interp(common_grid, df["distance"].values, df[col].values)
 
-        speed2_interp = np.interp(common_grid, tel2["Distance"], tel2["Speed"])
-        throttle2_interp = np.interp(common_grid, tel2["Distance"], tel2["Throttle"])
-        brake2_interp = np.interp(common_grid, tel2["Distance"], tel2["Brake"])
-        gear2_interp = np.interp(common_grid, tel2["Distance"], tel2["Gear"])
+        s1, t1, b1, g1 = interp(df1, "speed"), interp(df1, "throttle"), interp(df1, "brake"), interp(df1, "n_gear")
+        s2, t2, b2, g2 = interp(df2, "speed"), interp(df2, "throttle"), interp(df2, "brake"), interp(df2, "n_gear")
 
-        data1 = []
-        data2 = []
-        for i, dist in enumerate(common_grid):
-            data1.append({
-                "distance": float(dist),
-                "speed": float(speed1_interp[i]),
-                "throttle": float(throttle1_interp[i]),
-                "brake": bool(brake1_interp[i] > 0.5),
-                "gear": int(round(gear1_interp[i]))
-            })
-            data2.append({
-                "distance": float(dist),
-                "speed": float(speed2_interp[i]),
-                "throttle": float(throttle2_interp[i]),
-                "brake": bool(brake2_interp[i] > 0.5),
-                "gear": int(round(gear2_interp[i]))
-            })
+        data1 = [{"distance": float(d), "speed": float(s), "throttle": float(t), "brake": bool(b > 0.5), "gear": int(round(g))}
+                 for d, s, t, b, g in zip(common_grid, s1, t1, b1, g1)]
+        data2 = [{"distance": float(d), "speed": float(s), "throttle": float(t), "brake": bool(b > 0.5), "gear": int(round(g))}
+                 for d, s, t, b, g in zip(common_grid, s2, t2, b2, g2)]
 
         return {
             "year": year,
@@ -511,19 +587,21 @@ async def get_telemetry(year: int, location: str, driver1: str, driver2: str):
             "driver1": {
                 "code": driver1,
                 "color": color1,
-                "fullName": lap1.get("Driver", driver1),
-                "lapTime": format_lap_time_td(lap1.get("LapTime")),
+                "fullName": d1_fullname,
+                "lapTime": format_lap_time_seconds(lap1["lap_duration"]),
                 "stats": stats1,
                 "telemetry": data1
             },
             "driver2": {
                 "code": driver2,
                 "color": color2,
-                "fullName": lap2.get("Driver", driver2),
-                "lapTime": format_lap_time_td(lap2.get("LapTime")),
+                "fullName": d2_fullname,
+                "lapTime": format_lap_time_seconds(lap2["lap_duration"]),
                 "stats": stats2,
                 "telemetry": data2
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
