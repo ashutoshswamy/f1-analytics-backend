@@ -1,5 +1,8 @@
 # F1 Analytics — Backend
 
+> **Repo:** [ashutoshswamy/f1-analytics-backend](https://github.com/ashutoshswamy/f1-analytics-backend)  
+> **Frontend:** [ashutoshswamy/f1-analytics](https://github.com/ashutoshswamy/f1-analytics)
+
 Python backend that runs two services concurrently via `run.py`:
 
 - **FastAPI** REST server on port `8000` — consumed by the Next.js frontend
@@ -15,6 +18,8 @@ Python backend that runs two services concurrently via `run.py`:
 ## Setup
 
 ```bash
+git clone https://github.com/ashutoshswamy/f1-analytics-backend
+cd f1-analytics-backend
 python -m venv venv
 source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
@@ -48,6 +53,7 @@ All endpoints are prefixed with `/api`.
 
 | Method | Endpoint | Params | Description |
 |--------|----------|--------|-------------|
+| GET | `/api/health` | — | Health check — returns status and UTC timestamp |
 | GET | `/api/next_race` | — | Next GP countdown + weekend schedule |
 | GET | `/api/last_race` | — | Most recent race top 10 |
 | GET | `/api/schedule` | `year` (optional) | Full season calendar |

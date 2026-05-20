@@ -55,6 +55,10 @@ def format_lap_time_td(td):
         return f"{minutes}:{seconds:06.3f}"
     return f"{seconds:.3f}"
 
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+
 @app.get("/api/next_race")
 async def get_next_race():
     try:
