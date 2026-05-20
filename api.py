@@ -514,18 +514,39 @@ async def get_telemetry(year: int, location: str, driver1: str, driver2: str):
 
         # 4. Fetch car data for each fastest lap in parallel
         def lap_time_range(lap):
-            start_str = lap["date_start"]
+            start_str = lap.get("date_start")
+            if not start_str:
+                return None, None
             start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
             end = start + timedelta(seconds=float(lap["lap_duration"]) + 2)
             end_str = end.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
             return start_str, end_str
 
-        d1_start, d1_end = lap_time_range(lap1)
-        d2_start, d2_end = lap_time_range(lap2)
+        async def fetch_car_data(driver_num, lap):
+            start_str, end_str = lap_time_range(lap)
+            if start_str:
+                data = await fetch_openf1(
+                    f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={driver_num}&date>={start_str}&date<={end_str}"
+                )
+                if data:
+                    return data
+            # fallback: fetch all car data for driver in session, filter by lap time
+            all_data = await fetch_openf1(
+                f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={driver_num}"
+            )
+            if not all_data or not start_str:
+                return all_data
+            lap_start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+            lap_end = lap_start + timedelta(seconds=float(lap["lap_duration"]) + 2)
+            filtered = [
+                d for d in all_data
+                if d.get("date") and lap_start <= datetime.fromisoformat(d["date"].replace("Z", "+00:00")) <= lap_end
+            ]
+            return filtered if filtered else all_data[:400]
 
         car1_raw, car2_raw = await asyncio.gather(
-            fetch_openf1(f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={d1_num}&date>={d1_start}&date<={d1_end}"),
-            fetch_openf1(f"https://api.openf1.org/v1/car_data?session_key={session_key}&driver_number={d2_num}&date>={d2_start}&date<={d2_end}")
+            fetch_car_data(d1_num, lap1),
+            fetch_car_data(d2_num, lap2)
         )
 
         if not car1_raw:
