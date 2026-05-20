@@ -1,8 +1,11 @@
 import os
+import gc
 import json
+import asyncio
 import urllib.request
 import ssl
 from datetime import datetime, timezone
+from functools import lru_cache
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
@@ -22,9 +25,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enable FastF1 caching to ensure fast response times
+# Limit disk cache to 2 GB to prevent filling instance storage
 os.makedirs("f1_cache", exist_ok=True)
-fastf1.Cache.enable_cache("f1_cache")
+fastf1.Cache.enable_cache("f1_cache", max_size_gb=2)
+
+# Only 1 session load at a time — prevents concurrent RAM spikes on 512MB instance
+_session_load_sem = asyncio.Semaphore(1)
+_session_locks: dict = {}
+
+@lru_cache(maxsize=4)
+def _load_session_sync(year: int, location: str | int, session_type: str):
+    s = fastf1.get_session(year, location, session_type)
+    # Never load telemetry=True globally — too heavy for 512MB RAM.
+    # Telemetry is fetched per-lap via lap.get_car_data() instead.
+    s.load(telemetry=False, weather=False, messages=False)
+    return s
+
+async def _load_session(year: int, location: str | int, session_type: str):
+    key = (year, location, session_type)
+    if key not in _session_locks:
+        _session_locks[key] = asyncio.Lock()
+    async with _session_locks[key]:
+        async with _session_load_sem:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None, _load_session_sync, year, location, session_type
+            )
 
 def get_ssl_context():
     return ssl._create_unverified_context()
@@ -201,8 +227,7 @@ async def get_schedule(year: int = Query(default=None)):
 @app.get("/api/results")
 async def get_results(year: int, location: str):
     try:
-        session = fastf1.get_session(year, location, "R")
-        session.load(telemetry=False, weather=False, messages=False)
+        session = await _load_session(year, location, "R")
         results = session.results
         if results.empty:
             raise HTTPException(status_code=404, detail="No results found")
@@ -232,8 +257,7 @@ async def get_results(year: int, location: str):
 @app.get("/api/quali")
 async def get_quali(year: int, location: str):
     try:
-        session = fastf1.get_session(year, location, "Q")
-        session.load(telemetry=False, weather=False, messages=False)
+        session = await _load_session(year, location, "Q")
         results = session.results
         if results.empty:
             raise HTTPException(status_code=404, detail="No qualifying results found")
@@ -374,8 +398,7 @@ async def get_track_info(year: int, location: str):
 
         total_laps = "N/A"
         try:
-            ff1_session = fastf1.get_session(year, matched_race.get("round", "1"), "R")
-            ff1_session.load(telemetry=False, weather=False, messages=False)
+            ff1_session = await _load_session(year, int(matched_race.get("round", 1)), "R")
             results = ff1_session.results
             if not results.empty:
                 total_laps = str(int(results["Laps"].max()))
@@ -403,8 +426,7 @@ async def get_telemetry(year: int, location: str, driver1: str, driver2: str):
         driver1 = driver1.upper()
         driver2 = driver2.upper()
 
-        session = fastf1.get_session(year, location, "R")
-        session.load(telemetry=True, weather=False, messages=False)
+        session = await _load_session(year, location, "R")
 
         # Pick fastest laps
         lap1 = session.laps.pick_drivers(driver1).pick_fastest()
