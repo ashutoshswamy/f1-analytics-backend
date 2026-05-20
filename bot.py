@@ -122,7 +122,7 @@ async def speed_compare(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         session = fastf1.get_session(year, location, "R")
-        session.load(telemetry=False, weather=False, messages=False)
+        session.load(telemetry=True, weather=False, messages=False)
 
         laps_d1 = session.laps.pick_drivers(driver1).pick_fastest()
         laps_d2 = session.laps.pick_drivers(driver2).pick_fastest()
