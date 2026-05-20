@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-fastf1.Cache.no_cache()
+fastf1.Cache.disabled()
 
 DIVIDER = "─" * 20 + "\n"
 
